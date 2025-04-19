@@ -10,7 +10,7 @@ fn main() {
     const OUTPUT_NEURONS: usize = 10;
 
     let mut network = Network::new(vec![INPUT_NEURONS, 30, OUTPUT_NEURONS]);
-    let mut mnist_data = MnistData::new();
+    let mut mnist_data = MnistData::new().unwrap();
     let mut rng = thread_rng();
 
     network.stochastic_gradient_descent(&mut mnist_data, 30, 10, 3.0, &mut rng);

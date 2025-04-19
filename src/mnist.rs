@@ -1,7 +1,10 @@
 use flate2::read::GzDecoder;
 use itertools::Itertools;
 use ndarray::{Array, Array2};
-use std::{fs::File, io::Read};
+use std::{
+    fs::File,
+    io::{self, ErrorKind, Read},
+};
 
 // A single pair of a handwritten digit and its correct label. The expected_output is in the format
 // of a [10 x 1] array with the neuron linked to the correct value set to 1.0 and all other neurons
@@ -42,15 +45,15 @@ pub struct MnistData {
 }
 
 impl MnistData {
-    pub fn new() -> MnistData {
+    pub fn new() -> Result<MnistData, io::Error> {
         // Take a file path to MNIST data, and returns a Vec of u32s representing each value in the
         // underlying file.
-        fn read_bytes(path: &str) -> Vec<u8> {
-            let file = File::open(path).unwrap();
+        fn read_bytes(path: &str) -> Result<Vec<u8>, io::Error> {
+            let file = File::open(path)?;
             let mut unzipped_file = GzDecoder::new(file);
             let mut bytes = Vec::new();
-            unzipped_file.read_to_end(&mut bytes);
-            bytes
+            unzipped_file.read_to_end(&mut bytes)?;
+            Ok(bytes)
         }
 
         // Take the raw bytes of MNIST image data and MNIST label data, and convert these into
@@ -58,7 +61,7 @@ impl MnistData {
         fn images_and_labels_to_data(
             image_bytes: Vec<u8>,
             label_bytes: Vec<u8>,
-        ) -> Vec<MnistTestDatum> {
+        ) -> Result<Vec<MnistTestDatum>, io::Error> {
             let mut image_bytes_iter = image_bytes.into_iter();
             let mut label_bytes_iter = label_bytes.into_iter();
 
@@ -69,34 +72,60 @@ impl MnistData {
             // it can be reused for the individual image bytes later. The header bytes must be
             // collected so they can be chunked together and read as a single u32.
             let image_headers_bytes = image_bytes_iter.by_ref().take(16).collect::<Vec<_>>();
-            let mut image_headers_iter = image_headers_bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()));
+            let mut image_headers_iter = image_headers_bytes.chunks_exact(4).map(|chunk| {
+                u32::from_be_bytes(
+                    chunk
+                        .try_into()
+                        .expect("chunk should be guaranteed to have exactly 4 elements"),
+                )
+                .try_into()
+                // If try_into gives an error, this is because the number of images exceeds the max
+                // usize for this operating system. If this happens, the underlying problem is that
+                // a file with too many images to fit into memory was provided, so map the error
+                // type to one that represents this scenario.
+                .map_err(|_| ErrorKind::FileTooLarge)
+            });
 
-            // The magic number for an image file is 2051. If any other number is found here, either
-            // an incorrect file has been provided, or something has gone horribly wrong.
-            assert!(image_headers_iter.next() == Some(2051));
-            let images = image_headers_iter.next().unwrap();
-            let rows = image_headers_iter.next().unwrap();
-            let columns = image_headers_iter.next().unwrap();
+            // The magic number for an image file is 2051. Several things can go wrong here. If
+            // next() returns None, the header is incomplete and therefore malformed, so map it to
+            // ErrorKind::InvalidData. The iterator returns a Result that might indicate a
+            // FileTooLarge error. This is two errors in total, so use the ? operator twice to
+            // unpack both. Then check that the magic number has the correct value; if not, then
+            // this data is malformed so return a ErrorKind::InvalidData.
+            let magic_number = image_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
+            if magic_number != 2051 {
+                return Err(ErrorKind::InvalidData.into());
+            }
+            let images = image_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
+            let rows = image_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
+            let columns = image_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
 
             // Read the headers of the label bytes. These headers are just two 32-bit integers (8
             // bytes for the headers), which represent in order: the magic number (2049), and the
             // number of labels.
             let label_headers_bytes = label_bytes_iter.by_ref().take(8).collect::<Vec<_>>();
-            let mut label_headers_iter = label_headers_bytes
-                .chunks_exact(4)
-                .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()));
+            let mut label_headers_iter = label_headers_bytes.chunks_exact(4).map(|chunk| {
+                u32::from_be_bytes(
+                    chunk
+                        .try_into()
+                        .expect("chunk should be guaranteed to have exactly 4 elements"),
+                )
+                .try_into()
+                .map_err(|_| ErrorKind::FileTooLarge)
+            });
 
-            assert!(label_headers_iter.next() == Some(2049));
-            let labels = label_headers_iter.next().unwrap();
+            let magic_number = label_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
+            if magic_number != 2049 {
+                return Err(ErrorKind::InvalidData.into());
+            }
+            let labels = label_headers_iter.next().ok_or(ErrorKind::InvalidData)??;
 
             // There should be an equal number of images and labels. If not, either an incorrect
             // file has been provided, or something has gone horribly wrong.
             assert!(images == labels);
 
             // Initialize the MNIST data array that will hold the output of this function.
-            let mut data = Vec::with_capacity(images.try_into().unwrap());
+            let mut data = Vec::with_capacity(images);
 
             // The image bytes iterator and label bytes iterator have both had their headers
             // consumed, but none of the data bytes, so reuse them for the rest of the data. First,
@@ -105,7 +134,7 @@ impl MnistData {
             // this new iterator with the label bytes iterator, to iterate over every pair of an
             // image and its label.
             for (image_chunk, expected_answer) in image_bytes_iter
-                .chunks((rows * columns).try_into().unwrap())
+                .chunks(rows * columns)
                 .into_iter()
                 .zip(label_bytes_iter)
             {
@@ -127,13 +156,13 @@ impl MnistData {
                 })
             }
 
-            data
+            Ok(data)
         }
 
-        let training_image_bytes = read_bytes("data/train-images-idx3-ubyte.gz");
-        let training_label_bytes = read_bytes("data/train-labels-idx1-ubyte.gz");
+        let training_image_bytes = read_bytes("data/train-images-idx3-ubyte.gz")?;
+        let training_label_bytes = read_bytes("data/train-labels-idx1-ubyte.gz")?;
         let mut training_data =
-            images_and_labels_to_data(training_image_bytes, training_label_bytes);
+            images_and_labels_to_data(training_image_bytes, training_label_bytes)?;
 
         // Create the validation data set by taking the final 10000 training data samples.
         let validation_data = training_data.split_off(50000);
@@ -145,15 +174,15 @@ impl MnistData {
             .map(MnistTrainingDatum::from)
             .collect();
 
-        let test_image_bytes = read_bytes("data/t10k-images-idx3-ubyte.gz");
-        let test_label_bytes = read_bytes("data/t10k-labels-idx1-ubyte.gz");
-        let test_data = images_and_labels_to_data(test_image_bytes, test_label_bytes);
+        let test_image_bytes = read_bytes("data/t10k-images-idx3-ubyte.gz")?;
+        let test_label_bytes = read_bytes("data/t10k-labels-idx1-ubyte.gz")?;
+        let test_data = images_and_labels_to_data(test_image_bytes, test_label_bytes)?;
 
-        MnistData {
+        Ok(MnistData {
             training_data,
             validation_data,
             test_data,
-        }
+        })
     }
 }
 
