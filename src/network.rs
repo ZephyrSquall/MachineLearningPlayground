@@ -1,5 +1,5 @@
 use crate::mnist::{MnistData, MnistTrainingDatum};
-use ndarray::{Array, Array2};
+use ndarray::{Array, Array2, Axis, concatenate};
 use ndarray_rand::{
     RandomExt,
     rand::{Rng, seq::SliceRandom},
@@ -94,35 +94,30 @@ impl Network {
 
     // Adjust the network's biases and weights according to the given batch of training data.
     fn update_mini_batch(&mut self, mini_batch: &[MnistTrainingDatum], learning_rate: f64) {
-        // Get zero-initialized matrices matching the size of the weights and biases matrices.
-        let mut nabla_biases: Vec<Array2<f64>> = self
-            .biases
-            .iter()
-            .map(|bias| Array::zeros(bias.raw_dim()))
-            .collect();
-        let mut nabla_weights: Vec<Array2<f64>> = self
-            .weights
-            .iter()
-            .map(|weight| Array::zeros(weight.raw_dim()))
-            .collect();
+        // Combine each training datum input and expected output into a single matrix where each
+        // column corresponds to a separate datum.
+        let training_input_matrix = concatenate(
+            Axis(1),
+            &mini_batch
+                .iter()
+                .map(|mnist_training_datum| mnist_training_datum.input.view())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let training_expected_output_matrix = concatenate(
+            Axis(1),
+            &mini_batch
+                .iter()
+                .map(|mnist_training_datum| mnist_training_datum.expected_output.view())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
 
-        for mnist_training_datum in mini_batch {
-            let (delta_nabla_biases, delta_nabla_weights) =
-                self.backpropagate(mnist_training_datum);
-
-            // Add each change in bias gradient to the corresponding bias gradient
-            for (nabla_bias, delta_nabla_bias) in
-                nabla_biases.iter_mut().zip(delta_nabla_biases.iter())
-            {
-                *nabla_bias += delta_nabla_bias;
-            }
-            // Add each change in weight gradient to the corresponding weight gradient
-            for (nabla_weight, delta_nabla_weight) in
-                nabla_weights.iter_mut().zip(delta_nabla_weights.iter())
-            {
-                *nabla_weight += delta_nabla_weight;
-            }
-        }
+        let (mut nabla_biases, mut nabla_weights) = self.backpropagate(
+            &training_input_matrix,
+            &training_expected_output_matrix,
+            mini_batch.len(),
+        );
 
         for (bias, nabla_bias) in self.biases.iter_mut().zip(nabla_biases.iter_mut()) {
             // To avoid another allocation, the bias gradient can be safely mapped in-place to scale
@@ -132,9 +127,7 @@ impl Network {
             // The signature of the AddAssign operation for Arrays requires the right operand to be
             // a (non-mutable) reference, so deference the mutable reference and reborrow as a
             // (non-mutable) reference.
-            //println!("Bias before: {:6.3}", bias);
             *bias -= &*nabla_bias;
-            //println!("Bias after: {:6.3}", bias);
         }
         for (weight, nabla_weight) in self.weights.iter_mut().zip(nabla_weights.iter_mut()) {
             nabla_weight.mapv_inplace(|nb| nb * learning_rate / mini_batch.len() as f64);
@@ -145,7 +138,9 @@ impl Network {
     // Calculate the deltas of all biases and weights.
     fn backpropagate(
         &self,
-        mnist_training_datum: &MnistTrainingDatum,
+        training_input_matrix: &Array2<f64>,
+        training_expected_output_matrix: &Array2<f64>,
+        mini_batch_size: usize,
     ) -> (Vec<Array2<f64>>, Vec<Array2<f64>>) {
         // Get zero-initialized matrices matching the size of the weights and biases matrices.
         let mut nabla_biases: Vec<Array2<f64>> = self
@@ -159,7 +154,7 @@ impl Network {
             .map(|weight| Array::zeros(weight.raw_dim()))
             .collect();
 
-        let mut activation = mnist_training_datum.input.clone();
+        let mut activation = training_input_matrix.clone();
         let mut activations = Vec::with_capacity(self.num_layers);
         let mut zs = Vec::with_capacity(self.num_layers);
 
@@ -190,13 +185,19 @@ impl Network {
 
         let z = &mut zs[self.num_layers - 2];
         z.mapv_inplace(sigmoid_derivative);
-        let mut delta = (&activation - &mnist_training_datum.expected_output) * &*z;
-        // delta.mapv_inplace(sigmoid_derivative);
+        let mut delta = (&activation - training_expected_output_matrix) * &*z;
         activations.push(activation);
 
         // The index of the final activation layer is self.num_layers - 1. However, the second-last
         // index is needed, so which works out to self.num_layers - 2
-        nabla_biases[self.num_layers - 2] = delta.clone();
+        // Note that delta is a matrix where every column is the delta for the corresponding input
+        // in the training input matrix. nabla_biases wants the sum of all deltas, which means
+        // summing up each row in delta. This can be achieved with the dot product with a column
+        // matrix of all ones. Similarly, nabla_weights wants the sum of the dot product of the
+        // delta with each activation column vector, but it turns out combining all the activation
+        // column vectors into a single matrix causes the dot product of the delta with it to
+        // automatically sum everything up for us.
+        nabla_biases[self.num_layers - 2] = delta.clone().dot(&Array2::ones((mini_batch_size, 1)));
         nabla_weights[self.num_layers - 2] = delta.dot(&activations[self.num_layers - 2].t());
 
         for l in 2..self.num_layers {
@@ -204,7 +205,8 @@ impl Network {
             z.mapv_inplace(sigmoid_derivative);
             delta = self.weights[self.num_layers - l].t().dot(&delta) * &*z;
 
-            nabla_biases[self.num_layers - 1 - l] = delta.clone();
+            nabla_biases[self.num_layers - 1 - l] =
+                delta.clone().dot(&Array2::ones((mini_batch_size, 1)));
             nabla_weights[self.num_layers - 1 - l] =
                 delta.dot(&activations[self.num_layers - 1 - l].t());
         }
